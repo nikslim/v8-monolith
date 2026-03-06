@@ -1,0 +1,43 @@
+# Build a static monolithic V8 library to make embedding into other build systems easier
+v8_monolithic = true
+is_component_build = false
+v8_static_library = true
+v8_use_external_startup_data = false
+libcxx_is_shared = false
+
+# Flags that affect binary size
+is_debug = false
+symbol_level = 0
+strip_debug_info = true
+v8_symbol_level = 0
+use_rtti = false
+clang_use_chrome_plugins = false
+dcheck_always_on = false
+v8_enable_gdbjit = false
+v8_enable_test_features = false
+enable_rust = false
+v8_enable_temporal_support = false
+v8_enable_i18n_support = false
+
+# Security measures to reduce the impact of running untrusted JS code
+v8_enable_sandbox = false
+#v8_enable_external_code_space = true
+#use_safe_libcxx = true
+v8_enable_webassembly = false
+
+# As soon as v8_enabled_sandbox is disabled, use standard toolchain
+is_clang = true
+use_custom_libcxx = false
+
+# Target-specific settings
+target_os = "mac"
+target_cpu = "arm64"
+v8_target_cpu = "arm64"
+
+# Prefer not to pin the SDK locally unless this is a CI / reproducible build
+# Let GN/Xcode choose the appropriate SDK path automatically
+#mac_sdk_path="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk"
+use_sysroot = false
+
+# Otherwise you can't build v8, at least on mac
+v8_enable_pointer_compression=false
