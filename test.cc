@@ -38,6 +38,17 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+#if defined(V8_ENABLE_SANDBOX)
+  if (v8::V8::IsSandboxConfiguredSecurely()) {
+    std::cout << std::format("V8 sandbox: ENABLED (secure, {} MB)\n",
+        v8::V8::GetSandboxSizeInBytes() / (1024 * 1024));
+  } else {
+    std::cerr << "V8 sandbox: WARNING — fallback mode, not fully secure\n";
+  }
+#else
+  std::cout << "V8 sandbox: DISABLED (build without V8_ENABLE_SANDBOX)\n";
+#endif
+
   v8::Isolate::CreateParams create_params;
   create_params.array_buffer_allocator =
       v8::ArrayBuffer::Allocator::NewDefaultAllocator();

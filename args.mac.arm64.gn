@@ -20,14 +20,13 @@ v8_enable_temporal_support = false
 v8_enable_i18n_support = false
 
 # Security measures to reduce the impact of running untrusted JS code
-v8_enable_sandbox = false
-#v8_enable_external_code_space = true
-#use_safe_libcxx = true
+v8_enable_sandbox = true
+v8_enable_external_code_space = true
 v8_enable_webassembly = false
 
-# As soon as v8_enabled_sandbox is disabled, use standard toolchain
+# V8 sandbox requires pointer compression and custom (hardened) libc++
 is_clang = true
-use_custom_libcxx = false
+use_custom_libcxx = true
 
 # Target-specific settings
 target_os = "mac"
@@ -39,5 +38,5 @@ v8_target_cpu = "arm64"
 #mac_sdk_path="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk"
 use_sysroot = false
 
-# Otherwise you can't build v8, at least on mac
-v8_enable_pointer_compression=false
+# Required for v8_enable_sandbox
+v8_enable_pointer_compression=true
