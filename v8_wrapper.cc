@@ -47,23 +47,30 @@ static v8w_result value_to_result(v8::Isolate* isolate,
   return r;
 }
 
+// Safely stringify a v8::Value. Returns "(unknown)" rather than leaving a
+// nullptr behind if the value can't be converted.
+static std::string value_to_string(v8::Isolate* isolate,
+                                   v8::Local<v8::Value> value) {
+  if (value.IsEmpty()) return "(empty)";
+  v8::String::Utf8Value utf8(isolate, value);
+  return *utf8 ? std::string(*utf8) : std::string("(unknown)");
+}
+
 static std::string exception_message(v8::Isolate* isolate,
                                      v8::Local<v8::Context> context,
                                      v8::TryCatch& tc) {
   v8::HandleScope hs(isolate);
-  v8::String::Utf8Value ex(isolate, tc.Exception());
+  std::string ex = value_to_string(isolate, tc.Exception());
   v8::Local<v8::Message> msg = tc.Message();
-  if (!msg.IsEmpty()) {
-    v8::String::Utf8Value file(isolate, msg->GetScriptResourceName());
-    int line = msg->GetLineNumber(context).FromMaybe(0);
-    std::string s(*file);
-    s += ':';
-    s += std::to_string(line);
-    s += ": ";
-    s += *ex;
-    return s;
-  }
-  return std::string(*ex);
+  if (msg.IsEmpty()) return ex;
+  std::string file = value_to_string(isolate, msg->GetScriptResourceName());
+  int line = msg->GetLineNumber(context).FromMaybe(0);
+  std::string s = file;
+  s += ':';
+  s += std::to_string(line);
+  s += ": ";
+  s += ex;
+  return s;
 }
 
 // --- opaque types -----------------------------------------------------------
@@ -90,17 +97,24 @@ struct v8w_context {
   std::vector<std::unique_ptr<CallbackData>> callbacks;
 };
 
+// Throw a JS Error with the given UTF-8 message. Falls back silently if
+// V8 can't allocate the string (e.g. during a pending termination).
+static void throw_js_error(v8::Isolate* isolate, const char* msg) {
+  v8::Local<v8::String> s;
+  if (v8::String::NewFromUtf8(isolate, msg).ToLocal(&s))
+    isolate->ThrowException(v8::Exception::Error(s));
+}
+
 // Trampoline: unpack JS args, call C callback, convert v8w_result back to JS.
 static void callback_trampoline(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   v8::HandleScope hs(isolate);
-  v8::Local<v8::Context> context = isolate->GetCurrentContext();
 
   auto* data = static_cast<CallbackData*>(
       info.Data().As<v8::External>()->Value());
 
-  int argc = info.Length();
+  const int argc = info.Length();
   std::vector<v8w_arg> args(argc);
   // Hold Utf8Value objects alive for the duration of the call so that
   // borrowed `str_val` pointers remain valid.
@@ -126,33 +140,38 @@ static void callback_trampoline(
   v8w_result out{};
   data->cb(argc, args.data(), data->user_data, &out);
 
-  if (out.type == V8W_ERROR) {
-    const char* msg = out.str_val ? out.str_val : "callback error";
-    v8::Local<v8::String> s =
-        v8::String::NewFromUtf8(isolate, msg).ToLocalChecked();
-    isolate->ThrowException(v8::Exception::Error(s));
-    if (out.str_val) std::free(out.str_val);
-    return;
-  }
+  // RAII: any heap string the callback put in out.str_val is wrapper-owned
+  // now and must be freed on every exit path (success, error, re-throw).
+  struct OwnedStr {
+    char* p;
+    ~OwnedStr() { if (p) std::free(p); }
+  } owned{
+      (out.type == V8W_OK_STRING || out.type == V8W_ERROR) ? out.str_val
+                                                           : nullptr};
 
   switch (out.type) {
+    case V8W_ERROR:
+      throw_js_error(isolate, owned.p ? owned.p : "callback error");
+      return;
     case V8W_OK_INT32:
       info.GetReturnValue().Set(out.int_val);
-      break;
+      return;
     case V8W_OK_DOUBLE:
       info.GetReturnValue().Set(out.dbl_val);
-      break;
+      return;
     case V8W_OK_STRING: {
-      const char* s = out.str_val ? out.str_val : "";
-      v8::Local<v8::String> js =
-          v8::String::NewFromUtf8(isolate, s).ToLocalChecked();
+      v8::Local<v8::String> js;
+      if (!v8::String::NewFromUtf8(isolate, owned.p ? owned.p : "")
+               .ToLocal(&js)) {
+        throw_js_error(isolate, "callback returned invalid UTF-8");
+        return;
+      }
       info.GetReturnValue().Set(js);
-      if (out.str_val) std::free(out.str_val);
-      break;
+      return;
     }
     default:
       info.GetReturnValue().SetUndefined();
-      break;
+      return;
   }
 }
 
@@ -161,6 +180,14 @@ static void callback_trampoline(
 extern "C" {
 
 void v8w_free(char* ptr) { std::free(ptr); }
+
+void v8w_result_free(v8w_result* r) {
+  if (!r) return;
+  if (r->str_val) {
+    std::free(r->str_val);
+    r->str_val = nullptr;
+  }
+}
 
 v8w_engine* v8w_engine_new(void) {
   auto* e = new v8w_engine();
@@ -208,6 +235,10 @@ v8w_isolate* v8w_isolate_new(v8w_engine* engine) {
     delete iso;
     return nullptr;
   }
+  // Explicit policy makes microtask draining deterministic (needed by
+  // v8w_eval_async). Default kAuto triggers drains on script exit, which
+  // races with our manual checkpointing.
+  iso->isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
   return iso;
 }
 
@@ -277,13 +308,23 @@ v8w_result v8w_eval_async(v8w_context* ctx, const char* source) {
 
   v8::Local<v8::Value> val = maybe.ToLocalChecked();
   if (!val->IsPromise())
-    return make_error("Expected a Promise from async function");
+    return value_to_result(isolate, context, val);
 
   v8::Local<v8::Promise> promise = val.As<v8::Promise>();
-  while (promise->State() == v8::Promise::kPending)
-    v8::MicrotasksScope::PerformCheckpoint(isolate);
-  if (promise->State() == v8::Promise::kRejected)
-    return make_error("Promise rejected");
+  // Drain microtasks until the promise settles. Bound the loop so a
+  // promise chained on a never-fulfilled external task can't hang us.
+  constexpr int kMaxCheckpoints = 1'000'000;
+  for (int i = 0; promise->State() == v8::Promise::kPending; ++i) {
+    if (i >= kMaxCheckpoints)
+      return make_error("Promise still pending after microtask drain "
+                        "(waiting on non-microtask work?)");
+    isolate->PerformMicrotaskCheckpoint();
+  }
+  if (promise->State() == v8::Promise::kRejected) {
+    std::string msg =
+        "Promise rejected: " + value_to_string(isolate, promise->Result());
+    return make_error(msg.c_str());
+  }
   return value_to_result(isolate, context, promise->Result());
 }
 
