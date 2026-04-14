@@ -54,6 +54,30 @@ v8w_result v8w_eval(v8w_context* ctx, const char* source);
 // return the resolved value (or error on rejection)
 v8w_result v8w_eval_async(v8w_context* ctx, const char* source);
 
+// --- C++ <-> JS bindings ----------------------------------------------------
+
+// A single argument to a JS-called C callback. `str_val` is borrowed and only
+// valid for the duration of the callback — copy it if you need to keep it.
+typedef struct {
+  v8w_result_type type;     // V8W_OK_INT32, V8W_OK_DOUBLE, or V8W_OK_STRING
+  int32_t         int_val;
+  double          dbl_val;
+  const char*     str_val;
+} v8w_arg;
+
+// Callback invoked from JS. Fill *out_result before returning:
+//   - set type to V8W_OK_INT32/DOUBLE/STRING with the matching field
+//   - for STRING, str_val must be a malloc'd buffer (wrapper takes ownership)
+//   - to signal an error to JS, set type = V8W_ERROR and str_val to a
+//     malloc'd error message (wrapper throws Error(msg) in JS)
+typedef void (*v8w_callback)(int argc, const v8w_arg* argv,
+                             void* user_data, v8w_result* out_result);
+
+// Register a C callback as a global JS function on the context.
+// Returns 0 on success, non-zero on failure.
+int v8w_register_function(v8w_context* ctx, const char* name,
+                          v8w_callback cb, void* user_data);
+
 #ifdef __cplusplus
 }
 #endif

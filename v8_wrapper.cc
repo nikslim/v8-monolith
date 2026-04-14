@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "libplatform/libplatform.h"
 #include "v8.h"
@@ -76,10 +77,84 @@ struct v8w_isolate {
   v8::ArrayBuffer::Allocator* allocator;
 };
 
+struct CallbackData {
+  v8w_callback cb;
+  void*        user_data;
+};
+
 struct v8w_context {
   v8w_isolate* owner;
   v8::Global<v8::Context> persistent;
+  // Stable storage for C callbacks bound into this context. v8::External
+  // holds raw pointers into these; they must outlive the context.
+  std::vector<std::unique_ptr<CallbackData>> callbacks;
 };
+
+// Trampoline: unpack JS args, call C callback, convert v8w_result back to JS.
+static void callback_trampoline(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::HandleScope hs(isolate);
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
+  auto* data = static_cast<CallbackData*>(
+      info.Data().As<v8::External>()->Value());
+
+  int argc = info.Length();
+  std::vector<v8w_arg> args(argc);
+  // Hold Utf8Value objects alive for the duration of the call so that
+  // borrowed `str_val` pointers remain valid.
+  std::vector<std::unique_ptr<v8::String::Utf8Value>> utf8s;
+  utf8s.reserve(argc);
+
+  for (int i = 0; i < argc; ++i) {
+    v8::Local<v8::Value> v = info[i];
+    if (v->IsInt32()) {
+      args[i].type = V8W_OK_INT32;
+      args[i].int_val = v.As<v8::Int32>()->Value();
+    } else if (v->IsNumber()) {
+      args[i].type = V8W_OK_DOUBLE;
+      args[i].dbl_val = v.As<v8::Number>()->Value();
+    } else {
+      auto u = std::make_unique<v8::String::Utf8Value>(isolate, v);
+      args[i].type = V8W_OK_STRING;
+      args[i].str_val = **u ? **u : "";
+      utf8s.push_back(std::move(u));
+    }
+  }
+
+  v8w_result out{};
+  data->cb(argc, args.data(), data->user_data, &out);
+
+  if (out.type == V8W_ERROR) {
+    const char* msg = out.str_val ? out.str_val : "callback error";
+    v8::Local<v8::String> s =
+        v8::String::NewFromUtf8(isolate, msg).ToLocalChecked();
+    isolate->ThrowException(v8::Exception::Error(s));
+    if (out.str_val) std::free(out.str_val);
+    return;
+  }
+
+  switch (out.type) {
+    case V8W_OK_INT32:
+      info.GetReturnValue().Set(out.int_val);
+      break;
+    case V8W_OK_DOUBLE:
+      info.GetReturnValue().Set(out.dbl_val);
+      break;
+    case V8W_OK_STRING: {
+      const char* s = out.str_val ? out.str_val : "";
+      v8::Local<v8::String> js =
+          v8::String::NewFromUtf8(isolate, s).ToLocalChecked();
+      info.GetReturnValue().Set(js);
+      if (out.str_val) std::free(out.str_val);
+      break;
+    }
+    default:
+      info.GetReturnValue().SetUndefined();
+      break;
+  }
+}
 
 // --- C API ------------------------------------------------------------------
 
@@ -210,6 +285,36 @@ v8w_result v8w_eval_async(v8w_context* ctx, const char* source) {
   if (promise->State() == v8::Promise::kRejected)
     return make_error("Promise rejected");
   return value_to_result(isolate, context, promise->Result());
+}
+
+int v8w_register_function(v8w_context* ctx, const char* name,
+                          v8w_callback cb, void* user_data) {
+  if (!ctx || !name || !cb) return 1;
+  v8::Isolate* isolate = ctx->owner->isolate;
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context =
+      v8::Local<v8::Context>::New(isolate, ctx->persistent);
+  v8::Context::Scope context_scope(context);
+
+  auto data = std::make_unique<CallbackData>();
+  data->cb = cb;
+  data->user_data = user_data;
+  v8::Local<v8::External> ext = v8::External::New(isolate, data.get());
+
+  v8::Local<v8::FunctionTemplate> tpl =
+      v8::FunctionTemplate::New(isolate, callback_trampoline, ext);
+  v8::Local<v8::Function> fn;
+  if (!tpl->GetFunction(context).ToLocal(&fn)) return 2;
+
+  v8::Local<v8::String> js_name;
+  if (!v8::String::NewFromUtf8(isolate, name).ToLocal(&js_name)) return 3;
+
+  v8::Maybe<bool> ok = context->Global()->Set(context, js_name, fn);
+  if (ok.IsNothing() || !ok.FromJust()) return 4;
+
+  ctx->callbacks.push_back(std::move(data));
+  return 0;
 }
 
 } // extern "C"

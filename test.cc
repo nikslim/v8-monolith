@@ -19,6 +19,7 @@ static void RunErrorTests(v8w_context* ctx);
 static void RunStatePersistenceTests(v8w_context* ctx);
 static void RunContextIsolationTests(v8w_isolate* iso);
 static void RunMultiIsolateTests(v8w_engine* engine);
+static void RunBindingTests(v8w_context* ctx);
 
 static void check(v8w_result r, const char* label) {
   if (r.type == V8W_ERROR) {
@@ -59,6 +60,7 @@ int main() {
   run_in_fresh_context(engine, "Async/await tests", RunAsyncTests);
   run_in_fresh_context(engine, "Error tests", RunErrorTests);
   run_in_fresh_context(engine, "State persistence", RunStatePersistenceTests);
+  run_in_fresh_context(engine, "C++ <-> JS bindings", RunBindingTests);
 
   // Context isolation needs its own isolate, but creates two contexts inside.
   {
@@ -421,4 +423,159 @@ static void RunMultiIsolateTests(v8w_engine* engine) {
   v8w_isolate_free(iso2);
   v8w_context_free(ctx1);
   v8w_isolate_free(iso1);
+}
+
+// ---------------------------------------------------------------------------
+// C++ <-> JS bindings: register C callbacks as global JS functions
+// ---------------------------------------------------------------------------
+
+// Duplicate a C string via malloc, so the wrapper can free it.
+static char* c_strdup(const char* s) {
+  size_t len = std::strlen(s);
+  char* p = static_cast<char*>(std::malloc(len + 1));
+  std::memcpy(p, s, len + 1);
+  return p;
+}
+
+// add(a, b) — pure int32 in, int32 out.
+static void cb_add(int argc, const v8w_arg* argv, void* /*user_data*/,
+                   v8w_result* out) {
+  if (argc != 2 || argv[0].type != V8W_OK_INT32 ||
+      argv[1].type != V8W_OK_INT32) {
+    out->type = V8W_ERROR;
+    out->str_val = c_strdup("add: expected (int32, int32)");
+    return;
+  }
+  out->type = V8W_OK_INT32;
+  out->int_val = argv[0].int_val + argv[1].int_val;
+}
+
+// greet(name) — uses user_data (prefix) closed over from C++.
+static void cb_greet(int argc, const v8w_arg* argv, void* user_data,
+                     v8w_result* out) {
+  const char* prefix = static_cast<const char*>(user_data);
+  if (argc != 1 || argv[0].type != V8W_OK_STRING) {
+    out->type = V8W_ERROR;
+    out->str_val = c_strdup("greet: expected (string)");
+    return;
+  }
+  std::string msg = std::string(prefix) + argv[0].str_val;
+  out->type = V8W_OK_STRING;
+  out->str_val = c_strdup(msg.c_str());
+}
+
+// boom() — always throws into JS.
+static void cb_boom(int /*argc*/, const v8w_arg* /*argv*/, void* /*user_data*/,
+                    v8w_result* out) {
+  out->type = V8W_ERROR;
+  out->str_val = c_strdup("boom from C");
+}
+
+// counter() — increments state held in user_data, returns new value.
+static void cb_counter(int /*argc*/, const v8w_arg* /*argv*/, void* user_data,
+                       v8w_result* out) {
+  int* state = static_cast<int*>(user_data);
+  *state += 1;
+  out->type = V8W_OK_INT32;
+  out->int_val = *state;
+}
+
+static void RunBindingTests(v8w_context* ctx) {
+  // Register all functions.
+  static const char greet_prefix[] = "Hello, ";
+  static int counter_state = 0;
+  counter_state = 0;  // reset in case of reuse
+
+  assert(v8w_register_function(ctx, "cAdd", cb_add, nullptr) == 0);
+  assert(v8w_register_function(ctx, "cGreet", cb_greet,
+                               (void*)greet_prefix) == 0);
+  assert(v8w_register_function(ctx, "cBoom", cb_boom, nullptr) == 0);
+  assert(v8w_register_function(ctx, "cCounter", cb_counter,
+                               &counter_state) == 0);
+
+  // 1) Call C add from JS
+  {
+    auto r = v8w_eval(ctx, "cAdd(3, 4)");
+    check(r, "cAdd(3,4)");
+    assert(r.type == V8W_OK_INT32);
+    assert(r.int_val == 7);
+    std::cout << std::format("  cAdd(3, 4) = {}\n", r.int_val);
+  }
+
+  // 2) Call C string function with user_data prefix
+  {
+    auto r = v8w_eval(ctx, "cGreet('world')");
+    check(r, "cGreet");
+    assert(r.type == V8W_OK_STRING);
+    assert(std::string(r.str_val) == "Hello, world");
+    std::cout << std::format("  cGreet('world') = {}\n", r.str_val);
+    v8w_free(r.str_val);
+  }
+
+  // 3) C callback throws — JS catches it
+  {
+    auto r = v8w_eval(ctx, R"(
+      (function() {
+        try { cBoom(); return 'no-throw'; }
+        catch (e) { return 'caught: ' + e.message; }
+      })()
+    )");
+    check(r, "cBoom");
+    assert(r.type == V8W_OK_STRING);
+    assert(std::string(r.str_val) == "caught: boom from C");
+    std::cout << std::format("  cBoom() -> {}\n", r.str_val);
+    v8w_free(r.str_val);
+  }
+
+  // 4) Uncaught C exception propagates through v8w_eval as V8W_ERROR
+  {
+    auto r = v8w_eval(ctx, "cBoom()");
+    assert(r.type == V8W_ERROR);
+    assert(r.str_val != nullptr);
+    std::string_view msg = r.str_val;
+    assert(msg.find("boom from C") != std::string_view::npos);
+    std::cout << std::format("  uncaught cBoom: {}\n", r.str_val);
+    v8w_free(r.str_val);
+  }
+
+  // 5) Stateful callback — same v8w_context, multiple calls share user_data
+  {
+    auto r = v8w_eval(ctx, "cCounter(); cCounter(); cCounter()");
+    check(r, "cCounter x3");
+    assert(r.type == V8W_OK_INT32);
+    assert(r.int_val == 3);
+    assert(counter_state == 3);
+    std::cout << std::format("  cCounter x3 = {} (C state = {})\n",
+                             r.int_val, counter_state);
+  }
+
+  // 6) Callback invoked from async JS code
+  {
+    auto r = v8w_eval_async(ctx, R"(
+      (async function() {
+        const a = await Promise.resolve(10);
+        const b = await Promise.resolve(32);
+        return cAdd(a, b);
+      })()
+    )");
+    check(r, "async cAdd");
+    assert(r.type == V8W_OK_INT32);
+    assert(r.int_val == 42);
+    std::cout << std::format("  async cAdd(10, 32) = {}\n", r.int_val);
+  }
+
+  // 7) Argument type error from C surfaces as JS-catchable exception
+  {
+    auto r = v8w_eval(ctx, R"(
+      (function() {
+        try { cAdd('nope', 1); return 'no-throw'; }
+        catch (e) { return e.message; }
+      })()
+    )");
+    check(r, "cAdd type err");
+    assert(r.type == V8W_OK_STRING);
+    assert(std::string(r.str_val) == "add: expected (int32, int32)");
+    std::cout << std::format("  cAdd type error = {}\n", r.str_val);
+    v8w_free(r.str_val);
+  }
 }
