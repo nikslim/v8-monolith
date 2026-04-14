@@ -24,13 +24,26 @@ typedef enum {
   V8W_ERROR     = -1,
 } v8w_result_type;
 
+// Result of a JS evaluation.
+//
+// Ownership: `str_val` is heap-allocated (via malloc) and owned by the caller
+// when `type` is V8W_OK_STRING, V8W_OK_OTHER, or V8W_ERROR. For numeric types
+// (V8W_OK_INT32, V8W_OK_DOUBLE) str_val is unused and must not be freed.
+//
+// The simplest correct pattern is to always call v8w_result_free() — it is
+// a no-op for numeric types and nulls `str_val` so it's safe to call twice.
 typedef struct {
   v8w_result_type type;
   int32_t         int_val;
   double          dbl_val;
-  char*           str_val;  // heap-allocated; free with v8w_free()
+  char*           str_val;
 } v8w_result;
 
+// Release any heap memory owned by `r`. Safe on any result type, idempotent.
+void v8w_result_free(v8w_result* r);
+
+// Low-level free for raw buffers returned through the C ABI. Prefer
+// v8w_result_free() when releasing a v8w_result.
 void v8w_free(char* ptr);
 
 // Engine (platform + V8 init)
@@ -56,8 +69,15 @@ v8w_result v8w_eval_async(v8w_context* ctx, const char* source);
 
 // --- C++ <-> JS bindings ----------------------------------------------------
 
-// A single argument to a JS-called C callback. `str_val` is borrowed and only
-// valid for the duration of the callback — copy it if you need to keep it.
+// A single argument to a JS-called C callback.
+//
+// Ownership: `str_val` is BORROWED (note the `const char*`) and valid only
+// for the duration of the callback — if you need to keep the string, copy
+// it. This is the opposite of v8w_result.str_val, which is owned by the
+// caller.
+//
+// Non-numeric, non-string JS values (bool, null, object, …) arrive as
+// V8W_OK_STRING with `str_val` holding their JS string coercion.
 typedef struct {
   v8w_result_type type;     // V8W_OK_INT32, V8W_OK_DOUBLE, or V8W_OK_STRING
   int32_t         int_val;
